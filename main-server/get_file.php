@@ -520,13 +520,26 @@ if (isset($server_admin_rq))
 	$is_replace_domain_on_satellite=intval($server_admin_rq['is_replace_domain_on_satellite']);
 } else
 {
-	if (array_cnt($data_user_country)>0)
+	// prefer servers geographically nearest to the visitor (proximity-based routing)
+	require_once 'admin/include/functions_proximity.php';
+	$data_lb=proximity_select_servers($data_default,$_SERVER['GEOIP_COUNTRY_CODE']);
+	$sum_weight=0;
+	foreach ($data_lb as $server)
 	{
-		$data_lb=$data_user_country;
-		$sum_weight=$sum_weight_country;
-	} else {
-		$data_lb=$data_other;
-		$sum_weight=$sum_weight_other;
+		$sum_weight+=$server['lb_weight'];
+	}
+
+	// fall back to legacy country-assignment routing when proximity is undeterminable
+	if (array_cnt($data_lb)==0)
+	{
+		if (array_cnt($data_user_country)>0)
+		{
+			$data_lb=$data_user_country;
+			$sum_weight=$sum_weight_country;
+		} else {
+			$data_lb=$data_other;
+			$sum_weight=$sum_weight_other;
+		}
 	}
 
 	if (array_cnt($data_lb)==1)
