@@ -45,6 +45,20 @@ $origin_content_prefix = "videos";
 // (in this script's directory). Turn off once caching is verified.
 $cdn_debug = true;
 
+// SQLite database (next to this script) in which each served file's last-view
+// time is recorded, so the edge_prewarm.php cleanup cron can evict files nobody
+// watches. Must match $view_db_path in edge_prewarm.php. Requires the pdo_sqlite
+// PHP extension; leave empty (or if the extension is missing) to disable tracking.
+$view_db_path = __DIR__ . '/edge_cache.sqlite';
+
+// Real-time disk guard. When caching a newly-watched file would leave less than
+// this many bytes free on the content volume, the least-recently-viewed cached
+// files (per the view db above) are evicted until free space recovers - so a burst
+// of first-time views between cron runs cannot fill the disk. Top-list videos that
+// edge_prewarm.php publishes to the db are never evicted. 0 disables the real-time
+// guard (edge_prewarm.php still enforces its limits on schedule). Needs pdo_sqlite.
+$cache_min_free_bytes = 0;   // e.g. 20 * 1024 * 1024 * 1024 to keep ~20 GB free
+
 ######################################################################################
 
 $config['cv']="ed2317c592f17c6dcb43dd56cd3e4c1c";
@@ -152,6 +166,135 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 		$free_space = @disk_free_space(dirname($_SERVER['SCRIPT_FILENAME']));
 	}
 	echo "$load|$total_space|$free_space";
+	die;
+} elseif ($_REQUEST['action'] == 'load')
+{
+	// Lightweight load probe for the main server's load-based balancing in
+	// get_file.php: returns "<1-min loadavg>|<cpu cores>" so the caller can
+	// compare load per core. cores=0 when the count cannot be determined.
+	$load = 0;
+	if (function_exists('sys_getloadavg'))
+	{
+		$la = sys_getloadavg();
+		$load = floatval($la[0]);
+	}
+	$cores = 0;
+	if (@is_readable('/proc/cpuinfo'))
+	{
+		$cores = preg_match_all('/^processor\s*:/m', (string) @file_get_contents('/proc/cpuinfo'));
+	}
+	echo "$load|" . intval($cores);
+	die;
+} elseif ($_REQUEST['action'] == 'monitor')
+{
+	// Aggregated JSON stats for the standalone monitoring dashboard
+	// (monitor_server/server_monitor.php): CPU, disk, network and cache counters
+	// in one authenticated call. CPU jiffies and network byte counters are
+	// cumulative (straight from /proc), so the dashboard computes usage rates
+	// from the delta between its own polls and this endpoint stays stateless.
+	if ($_REQUEST['cv'] != $config['cv'])
+	{
+		sleep(1);
+		http_response_code(403);
+		header("KVS-Errno: 2");
+		echo "Access denied (errno 2)";
+		die;
+	}
+	header('Content-Type: application/json; charset=utf-8');
+	header('Cache-Control: no-store');
+
+	$loadavg = array(0.0, 0.0, 0.0);
+	if (function_exists('sys_getloadavg'))
+	{
+		$la = sys_getloadavg();
+		$loadavg = array(floatval($la[0]), floatval($la[1]), floatval($la[2]));
+	}
+
+	$cores = 0;
+	if (@is_readable('/proc/cpuinfo'))
+	{
+		$cores = preg_match_all('/^processor\s*:/m', (string) @file_get_contents('/proc/cpuinfo'));
+	}
+
+	// cumulative CPU jiffies since boot: total across all states, and idle+iowait
+	$cpu = null;
+	if (@is_readable('/proc/stat') && preg_match('/^cpu\s+(.+)$/m', (string) @file_get_contents('/proc/stat'), $m))
+	{
+		$fields = preg_split('/\s+/', trim($m[1]));
+		if (count($fields) >= 4 && is_numeric($fields[0]))
+		{
+			$total = 0;
+			$n = min(8, count($fields));
+			for ($i = 0; $i < $n; $i++)
+			{
+				$total += floatval($fields[$i]);
+			}
+			$cpu = array('total' => $total, 'idle' => floatval($fields[3]) + (isset($fields[4]) ? floatval($fields[4]) : 0));
+		}
+	}
+
+	// cumulative network bytes since boot, summed over all non-loopback interfaces
+	$net = null;
+	if (@is_readable('/proc/net/dev'))
+	{
+		$rx = 0.0;
+		$tx = 0.0;
+		$found = false;
+		foreach ((array) @file('/proc/net/dev') as $line)
+		{
+			if (strpos($line, ':') === false)
+			{
+				continue;
+			}
+			list($iface, $data) = explode(':', $line, 2);
+			if (trim($iface) == 'lo')
+			{
+				continue;
+			}
+			$fields = preg_split('/\s+/', trim($data));
+			if (count($fields) >= 9 && is_numeric($fields[0]))
+			{
+				$rx += floatval($fields[0]);
+				$tx += floatval($fields[8]);
+				$found = true;
+			}
+		}
+		if ($found)
+		{
+			$net = array('rx_bytes' => $rx, 'tx_bytes' => $tx);
+		}
+	}
+
+	$uptime = null;
+	if (@is_readable('/proc/uptime'))
+	{
+		$u = explode(' ', trim((string) @file_get_contents('/proc/uptime')));
+		if (isset($u[0]) && is_numeric($u[0]))
+		{
+			$uptime = intval(floatval($u[0]));
+		}
+	}
+
+	// disk usage of the content/cache volume (same fallback logic as action=status)
+	$script_dir = dirname($_SERVER['SCRIPT_FILENAME']);
+	$prefix = trim(str_replace('\\', '/', $origin_content_prefix), '/');
+	$disk_dir = ($prefix != '' && (is_dir("$script_dir/$prefix") || is_link("$script_dir/$prefix"))) ? "$script_dir/$prefix" : $script_dir;
+
+	echo json_encode(array(
+		'ok'          => true,
+		'edge'        => (trim($origin_url) != ''),
+		'api_version' => $api_version,
+		'time'        => time(),
+		'uptime'      => $uptime,
+		'loadavg'     => $loadavg,
+		'cores'       => intval($cores),
+		'cpu'         => $cpu,
+		'net'         => $net,
+		'disk'        => array('total' => @disk_total_space($disk_dir), 'free' => @disk_free_space($disk_dir)),
+		'cache'       => remote_monitor_cache_stats(),
+		'views_15m'   => remote_monitor_recent_views(900),
+		'views_24h'   => remote_monitor_recent_views(86400),
+	));
 	die;
 } elseif ($_REQUEST['action'] == 'time')
 {
@@ -389,6 +532,28 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 		$local_path = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_FILENAME'])), '/') . $content_relative;
 		$accel_uri = "$target_file$start_str";
 
+		// Logical, un-prefixed origin path (e.g. "29000/29350/29350_720p.mp4"): the
+		// origin signs its get_file.php hash over this, so strip this edge's content
+		// prefix (e.g. "videos/") from the local relative path. Used both to pull the
+		// file from the origin and as the key under which its view time is recorded.
+		$origin_video_file = ltrim($content_relative, '/');
+		$content_prefix = trim(str_replace('\\', '/', $origin_content_prefix), '/');
+		if ($content_prefix != '' && strpos($origin_video_file, $content_prefix . '/') === 0)
+		{
+			$origin_video_file = substr($origin_video_file, strlen($content_prefix) + 1);
+		}
+
+		$client_range = trim($_SERVER['HTTP_RANGE']);
+		$is_partial = ($client_range != '' && !preg_match('#^bytes=0-$#', $client_range));
+
+		// Record that this file was watched, on playback-start requests only (not on
+		// every mid-file seek), so the cleanup cron can age out files nobody views.
+		// Applies to both cache hits and misses; never fatal to serving the file.
+		if (!$is_partial)
+		{
+			remote_record_view($origin_video_file);
+		}
+
 		if (is_file($local_path))
 		{
 			// CACHE HIT
@@ -400,21 +565,11 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 			die;
 		}
 
-		// CACHE MISS: build a signed get_file.php link back to the origin. The
-		// origin signs its hash over the logical, un-prefixed file path, so strip
-		// this edge's content prefix (e.g. "videos/") from the local relative path.
+		// CACHE MISS: build a signed get_file.php link back to the origin.
 		// admin_rq_server_id + dsc make the origin deliver the master copy with its
 		// own hot-link/access checks disabled.
-		$origin_video_file = ltrim($content_relative, '/');
-		$content_prefix = trim(str_replace('\\', '/', $origin_content_prefix), '/');
-		if ($content_prefix != '' && strpos($origin_video_file, $content_prefix . '/') === 0)
-		{
-			$origin_video_file = substr($origin_video_file, strlen($content_prefix) + 1);
-		}
 		$origin_file_url = remote_origin_pull_url($origin_url, $origin_sg_id, $origin_server_id, $origin_video_file);
 
-		$client_range = trim($_SERVER['HTTP_RANGE']);
-		$is_partial = ($client_range != '' && !preg_match('#^bytes=0-$#', $client_range));
 		remote_cdn_log(($is_partial ? 'PROXY' : 'STREAM') . " miss local=$local_path range=" . ($client_range != '' ? $client_range : '-') . " origin=$origin_file_url");
 
 		// In debug mode, verify up-front that this edge can actually persist what
@@ -777,6 +932,10 @@ function remote_cdn_stream_and_cache($origin_url, $local_path, $limit, $accel_ur
 		return;
 	}
 
+	// About to write a new file into the cache (a first-time view): if the volume is
+	// low on free space, evict least-recently-viewed cached files first to make room.
+	remote_cdn_enforce_free_space($local_path);
+
 	$out = @fopen($tmp_path, 'wb');
 	if (!$out)
 	{
@@ -926,5 +1085,267 @@ function remote_cdn_throttle(&$state, $bytes)
 				usleep((int) ($sleep * 1000000));
 			}
 		}
+	}
+}
+
+// #############################################################################
+// View tracking (SQLite)
+// #############################################################################
+
+// Open (once per request) the SQLite view database as a PDO handle and ensure the
+// schema exists. Returns the handle, or null if tracking is disabled, the
+// pdo_sqlite extension is missing, or the database cannot be opened. Failures are
+// logged (when $cdn_debug is on) and never interrupt serving the file.
+function remote_view_db()
+{
+	global $view_db_path;
+	static $db = false; // false = not tried yet, null = unavailable
+
+	if ($db !== false)
+	{
+		return $db;
+	}
+	$db = null;
+
+	if (empty($view_db_path) || !extension_loaded('pdo_sqlite'))
+	{
+		return $db;
+	}
+	try
+	{
+		$pdo = new PDO('sqlite:' . $view_db_path);
+		$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+		// WAL + a busy timeout let many concurrent viewers record without blocking.
+		$pdo->exec('PRAGMA journal_mode=WAL');
+		$pdo->exec('PRAGMA busy_timeout=3000');
+		$pdo->exec('CREATE TABLE IF NOT EXISTS file_views (path TEXT PRIMARY KEY, last_viewed INTEGER NOT NULL)');
+		// Index the LRU order so the real-time low-disk evictor picks victims cheaply.
+		$pdo->exec('CREATE INDEX IF NOT EXISTS idx_file_views_last_viewed ON file_views(last_viewed)');
+		// Top-list paths that edge_prewarm.php publishes here so the evictor spares them.
+		$pdo->exec('CREATE TABLE IF NOT EXISTS protected_paths (path TEXT PRIMARY KEY)');
+		$db = $pdo;
+	} catch (Exception $e)
+	{
+		remote_cdn_log('view-db open failed: ' . $e->getMessage());
+		$db = null;
+	}
+	return $db;
+}
+
+// Upsert the current time as the last-viewed time for a logical file path. Best
+// effort: any failure is logged and swallowed so it can never break the response.
+function remote_record_view($path)
+{
+	if ($path === '' || strpos($path, '..') !== false)
+	{
+		return;
+	}
+	$db = remote_view_db();
+	if (!$db)
+	{
+		return;
+	}
+	try
+	{
+		$stmt = $db->prepare('INSERT OR REPLACE INTO file_views (path, last_viewed) VALUES (?, ?)');
+		$stmt->execute(array($path, time()));
+	} catch (Exception $e)
+	{
+		remote_cdn_log('view-db write failed: ' . $e->getMessage());
+	}
+}
+
+// Real-time disk guard, called just before a newly-watched file is written to the
+// cache. If the content volume has dropped below $cache_min_free_bytes free, evict
+// the least-recently-viewed cached files (per the view db) until free space
+// recovers. Deliberately cheap and bounded so it can run inside a request:
+//   - triggered by an O(1) disk_free_space() check (no directory walk);
+//   - victims are read straight from the LRU index, capped per call;
+//   - a non-blocking lock means only one worker evicts at a time (others skip);
+//   - top-list paths published by edge_prewarm.php are excluded, and the file being
+//     written is never a candidate (it is not on disk yet).
+// $local_path is the full cache path about to be written.
+function remote_cdn_enforce_free_space($local_path)
+{
+	global $cache_min_free_bytes, $origin_content_prefix;
+
+	if (empty($cache_min_free_bytes) || $cache_min_free_bytes <= 0)
+	{
+		return;
+	}
+
+	$volume_dir = dirname($local_path);
+	$free = @disk_free_space($volume_dir);
+	if ($free === false || $free >= $cache_min_free_bytes)
+	{
+		return; // plenty free (or cannot tell) - nothing to do
+	}
+
+	$db = remote_view_db();
+	if (!$db)
+	{
+		return; // no view db - cannot choose LRU victims
+	}
+
+	$root = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_FILENAME'])), '/');
+	$prefix = trim(str_replace('\\', '/', $origin_content_prefix), '/');
+	$base = ($prefix !== '') ? "$root/$prefix" : $root;
+
+	// Only one worker evicts at a time; the rest carry on (a later request retries).
+	$lock = @fopen("$root/.evict.lock", 'c');
+	if (!$lock || !flock($lock, LOCK_EX | LOCK_NB))
+	{
+		if ($lock)
+		{
+			@fclose($lock);
+		}
+		return;
+	}
+
+	$local_norm = str_replace('\\', '/', $local_path);
+	$evicted = array();
+	try
+	{
+		// Oldest-viewed first, excluding protected (top-list) paths. Bounded.
+		$rows = $db->query('SELECT path FROM file_views WHERE path NOT IN (SELECT path FROM protected_paths) ORDER BY last_viewed ASC LIMIT 500');
+		foreach ($rows as $row)
+		{
+			$full = "$base/" . ltrim($row['path'], '/');
+			if ($full === $local_norm || !is_file($full))
+			{
+				continue; // never the file we are about to write; skip already-gone rows
+			}
+			if (@unlink($full))
+			{
+				$evicted[] = $row['path'];
+				remote_cdn_log("EVICT low-disk $row[path]");
+				if (@disk_free_space($volume_dir) >= $cache_min_free_bytes)
+				{
+					break; // recovered enough headroom
+				}
+			}
+		}
+
+		if (count($evicted) > 0)
+		{
+			$stmt = $db->prepare('DELETE FROM file_views WHERE path = ?');
+			foreach ($evicted as $p)
+			{
+				$stmt->execute(array($p));
+			}
+		}
+	} catch (Exception $e)
+	{
+		remote_cdn_log('low-disk eviction failed: ' . $e->getMessage());
+	}
+
+	@flock($lock, LOCK_UN);
+	@fclose($lock);
+}
+
+// #############################################################################
+// Monitoring endpoint helpers (action=monitor)
+// #############################################################################
+
+// Walk the content/cache tree and count cached videos (distinct per-video
+// directories holding at least one video-format file), video files, total files
+// and total bytes. The walk can take seconds on a full cache, so the result is
+// cached in edge_monitor_stats.dat next to this script for 5 minutes, and a
+// non-blocking lock ensures only one worker recounts at a time (the rest serve
+// the stale value). Returns the stats array, or null before the first count.
+function remote_monitor_cache_stats()
+{
+	global $origin_content_prefix;
+
+	$root = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_FILENAME'])), '/');
+	$prefix = trim(str_replace('\\', '/', $origin_content_prefix), '/');
+	$base = ($prefix !== '') ? "$root/$prefix" : $root;
+
+	$cache_file = "$root/edge_monitor_stats.dat";
+	$ttl = 300;
+
+	$cached = @json_decode((string) @file_get_contents($cache_file), true);
+	if (is_array($cached) && isset($cached['counted_at']) && time() - $cached['counted_at'] < $ttl)
+	{
+		return $cached;
+	}
+
+	$lock = @fopen("$cache_file.lock", 'c');
+	if (!$lock || !flock($lock, LOCK_EX | LOCK_NB))
+	{
+		if ($lock)
+		{
+			@fclose($lock);
+		}
+		return is_array($cached) ? $cached : null;
+	}
+
+	@set_time_limit(0);
+	$video_ext = array('mp4' => 1, 'm4v' => 1, 'webm' => 1, 'flv' => 1, 'mov' => 1, 'avi' => 1, 'wmv' => 1, 'mkv' => 1, 'mpg' => 1, 'mpeg' => 1, 'ts' => 1);
+	$stats = array('videos' => 0, 'video_files' => 0, 'files' => 0, 'bytes' => 0, 'counted_at' => time());
+	if (is_dir($base))
+	{
+		$video_dirs = array();
+		try
+		{
+			$it = new RecursiveIteratorIterator(
+				new RecursiveDirectoryIterator($base, FilesystemIterator::SKIP_DOTS),
+				RecursiveIteratorIterator::LEAVES_ONLY,
+				RecursiveIteratorIterator::CATCH_GET_CHILD
+			);
+			foreach ($it as $file)
+			{
+				if (!$file->isFile())
+				{
+					continue;
+				}
+				$ext = strtolower(pathinfo($file->getFilename(), PATHINFO_EXTENSION));
+				if ($ext == 'part' || $ext == 'lock')
+				{
+					continue; // in-progress cache fills and lock files
+				}
+				$stats['files']++;
+				$size = @filesize($file->getPathname());
+				if ($size !== false)
+				{
+					$stats['bytes'] += $size;
+				}
+				if (isset($video_ext[$ext]))
+				{
+					$stats['video_files']++;
+					$video_dirs[dirname($file->getPathname())] = 1;
+				}
+			}
+			$stats['videos'] = count($video_dirs);
+		} catch (Exception $e)
+		{
+			remote_cdn_log('monitor cache count failed: ' . $e->getMessage());
+		}
+	}
+
+	@file_put_contents($cache_file, json_encode($stats), LOCK_EX);
+	@flock($lock, LOCK_UN);
+	@fclose($lock);
+	return $stats;
+}
+
+// Number of distinct cached files viewed within the last $seconds, per the
+// SQLite view db. Returns null when view tracking is unavailable.
+function remote_monitor_recent_views($seconds)
+{
+	$db = remote_view_db();
+	if (!$db)
+	{
+		return null;
+	}
+	try
+	{
+		$stmt = $db->prepare('SELECT COUNT(*) FROM file_views WHERE last_viewed >= ?');
+		$stmt->execute(array(time() - $seconds));
+		return intval($stmt->fetchColumn());
+	} catch (Exception $e)
+	{
+		remote_cdn_log('view-db count failed: ' . $e->getMessage());
+		return null;
 	}
 }
