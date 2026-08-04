@@ -1,19 +1,21 @@
 <?php
 /* Developed by Kernel Team.
    http://kernel-team.com
+
+   EDGE build of remote_control.php (KVS 6.4.0 API) with CDN pull-through
+   caching: files this server does not have yet are pulled on demand from the
+   origin (main) server, cached to local disk and served. Deploy on each edge
+   renamed to remote_control.php.
 */
 
 error_reporting(E_ERROR | E_PARSE | E_COMPILE_ERROR);
-$api_version = '5.3.0';
+$api_version = '6.4.0';
 
 // comma separated list of whitelisted IPs
-$whitelist_ips = "";
+$whitelist_ips = '';
 
 // comma separated list of whitelisted referers
-$whitelist_referers = "";
-
-// the number of seconds temp links are valid
-$ttl = 3600;
+$whitelist_referers = '';
 
 // ------------------------------- CDN origin -------------------------------
 // This script can act as a caching edge: files it does not have yet are pulled
@@ -36,9 +38,9 @@ $ttl = 3600;
 //                    prefix is stripped to recover the origin's logical file
 //                    ("29000/29350/f.mp4") that get_file.php signs its hash over.
 //                    Leave empty if this script lives inside the content folder.
-$origin_url = "https://baddies.xxx";
-$origin_server_id = "8";
-$origin_sg_id = 7;
+$origin_url = "https://pimpbunny.com";
+$origin_server_id = "49";
+$origin_sg_id = 47;
 $origin_content_prefix = "videos";
 
 // set true to append pull-through cache diagnostics to remote_control_cdn.log
@@ -59,11 +61,21 @@ $view_db_path = __DIR__ . '/edge_cache.sqlite';
 // guard (edge_prewarm.php still enforces its limits on schedule). Needs pdo_sqlite.
 $cache_min_free_bytes = 0;   // e.g. 20 * 1024 * 1024 * 1024 to keep ~20 GB free
 
+// The 6.4.0 API authenticates version/ip/status/time/check with cv=md5(secret),
+// but KVS cores before 6.4 (this project's admin includes among them) call these
+// actions with no cv at all. While the main server runs such a core, leave this
+// true so its server checks keep working; set false to enforce strict 6.4 auth
+// once the core sends the hash.
+$allow_unauthenticated_legacy_actions = true;
+
 ######################################################################################
 
-$config['cv']="ed2317c592f17c6dcb43dd56cd3e4c1c";
+$config['cv']="5884a0f77f3943836108c7611e7c021b";
 
-if (isset($_SERVER['HTTP_X_FORWARDED_FOR']))
+if (isset($_SERVER['HTTP_CF_CONNECTING_IP']))
+{
+	$_SERVER['REMOTE_ADDR'] = $_SERVER['HTTP_CF_CONNECTING_IP'];
+} elseif (isset($_SERVER['HTTP_X_FORWARDED_FOR']))
 {
 	$_SERVER['REMOTE_ADDR'] = $_SERVER['HTTP_X_FORWARDED_FOR'];
 	if (strpos($_SERVER['REMOTE_ADDR'], ',') !== false)
@@ -75,60 +87,63 @@ if (isset($_SERVER['HTTP_X_FORWARDED_FOR']))
 	$_SERVER['REMOTE_ADDR'] = $_SERVER['HTTP_X_REAL_IP'];
 }
 
-if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
+$action = trim($_REQUEST['action'] ?? '');
+$hash = trim($_REQUEST['cv'] ?? '');
+$file = trim($_REQUEST['file'] ?? '');
+
+if ($action == '' && $file == '')
 {
-	echo "connected.";
-	die;
-} elseif ($_REQUEST['action'] == 'version')
+	die('connected.');
+} elseif ($action == 'version')
 {
-	echo $api_version;
-	die;
-} elseif ($_REQUEST['action'] == 'ip')
-{
-	echo $_SERVER['REMOTE_ADDR'];
-	die;
-} elseif ($_REQUEST['action'] == 'path')
-{
-	if ($_REQUEST['cv'] != $config['cv'])
+	if (!edge_check_cv($hash, false, true))
 	{
 		sleep(1);
 		http_response_code(403);
-		header("KVS-Errno: 2");
-		echo "Access denied (errno 2)";
-		die;
+		die('missing key');
 	}
-	echo dirname($_SERVER['SCRIPT_FILENAME']);
-} elseif ($_REQUEST['action'] == 'cdncheck')
+	die($api_version);
+} elseif ($action == 'ip')
+{
+	if (!edge_check_cv($hash, false, true))
+	{
+		sleep(1);
+		http_response_code(403);
+		die('missing key');
+	}
+	header("KVS-IP: $_SERVER[REMOTE_ADDR]");
+	die($_SERVER['REMOTE_ADDR'] ?? '');
+} elseif ($action == 'path')
+{
+	if (!edge_check_cv($hash, true, false))
+	{
+		sleep(1);
+		http_response_code(403);
+		die('missing key');
+	}
+	die(dirname($_SERVER['SCRIPT_FILENAME']));
+} elseif ($action == 'cdncheck')
 {
 	// Diagnostic: report (and actually attempt) whether this edge can write the
 	// CDN cache log and the content/cache directory, returning a plain-text
 	// report in the body so failures are directly visible. Auth'd with cv, like
 	// the 'path' action. Hit: /remote_control.php?action=cdncheck&cv=<config cv>
-	if ($_REQUEST['cv'] != $config['cv'])
+	if (!edge_check_cv($hash, true, false))
 	{
 		sleep(1);
 		http_response_code(403);
-		header("KVS-Errno: 2");
-		echo "Access denied (errno 2)";
-		die;
+		die('missing key');
 	}
 	header('Content-Type: text/plain; charset=utf-8');
 	$script_dir = dirname($_SERVER['SCRIPT_FILENAME']);
 	$log = $script_dir . '/remote_control_cdn.log';
 	$content_dir = rtrim(str_replace('\\', '/', $script_dir), '/') . '/' . trim(str_replace('\\', '/', $origin_content_prefix), '/');
 
-	$user = '?';
-	if (function_exists('posix_geteuid') && function_exists('posix_getpwuid'))
-	{
-		$pw = @posix_getpwuid(posix_geteuid());
-		$user = $pw ? $pw['name'] : (string) @posix_geteuid();
-	} elseif (getenv('USERNAME') || getenv('USER'))
-	{
-		$user = getenv('USERNAME') ?: getenv('USER');
-	}
+	$user = remote_cdn_process_user();
 
 	$log_test = @file_put_contents($log, date('[Y-m-d H:i:s] ') . "cdncheck self-test write\n", FILE_APPEND | LOCK_EX);
 
+	echo "api_version      : $api_version\n";
 	echo "php_process_user : $user\n";
 	echo "cdn_debug        : " . ($cdn_debug ? 'on' : 'off') . "\n";
 	echo "curl_available   : " . (function_exists('curl_init') ? 'yes' : 'no') . "\n";
@@ -146,8 +161,14 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 	echo "content_exists   : " . (is_dir($content_dir) ? 'yes' : 'no') . "\n";
 	echo "content_writable : " . ((is_dir($content_dir) && is_writable($content_dir)) ? 'yes' : 'NO') . "\n";
 	die;
-} elseif ($_REQUEST['action'] == 'status')
+} elseif ($action == 'status')
 {
+	if (!edge_check_cv($hash, false, true))
+	{
+		sleep(1);
+		http_response_code(403);
+		die('missing key');
+	}
 	if (function_exists('sys_getloadavg'))
 	{
 		$load = sys_getloadavg();
@@ -156,22 +177,23 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 		$load = [0];
 	}
 	$load = floatval($load[0]);
-	if ($_REQUEST['content_path'] != '' && (is_dir(dirname($_SERVER['SCRIPT_FILENAME']) . "/$_REQUEST[content_path]") || is_link(dirname($_SERVER['SCRIPT_FILENAME']) . "/$_REQUEST[content_path]")))
+	$content_path = trim($_REQUEST['content_path'] ?? '');
+	if ($content_path !== '' && (is_dir(dirname($_SERVER['SCRIPT_FILENAME']) . "/$content_path") || is_link(dirname($_SERVER['SCRIPT_FILENAME']) . "/$content_path")))
 	{
-		$total_space = @disk_total_space(dirname($_SERVER['SCRIPT_FILENAME']) . "/$_REQUEST[content_path]");
-		$free_space = @disk_free_space(dirname($_SERVER['SCRIPT_FILENAME']) . "/$_REQUEST[content_path]");
+		$total_space = @disk_total_space(dirname($_SERVER['SCRIPT_FILENAME']) . "/$content_path");
+		$free_space = @disk_free_space(dirname($_SERVER['SCRIPT_FILENAME']) . "/$content_path");
 	} else
 	{
 		$total_space = @disk_total_space(dirname($_SERVER['SCRIPT_FILENAME']));
 		$free_space = @disk_free_space(dirname($_SERVER['SCRIPT_FILENAME']));
 	}
-	echo "$load|$total_space|$free_space";
-	die;
-} elseif ($_REQUEST['action'] == 'load')
+	die("$load|$total_space|$free_space");
+} elseif ($action == 'load')
 {
 	// Lightweight load probe for the main server's load-based balancing in
 	// get_file.php: returns "<1-min loadavg>|<cpu cores>" so the caller can
 	// compare load per core. cores=0 when the count cannot be determined.
+	// Unauthenticated by design - the main server's probe sends no cv.
 	$load = 0;
 	if (function_exists('sys_getloadavg'))
 	{
@@ -183,22 +205,19 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 	{
 		$cores = preg_match_all('/^processor\s*:/m', (string) @file_get_contents('/proc/cpuinfo'));
 	}
-	echo "$load|" . intval($cores);
-	die;
-} elseif ($_REQUEST['action'] == 'monitor')
+	die("$load|" . intval($cores));
+} elseif ($action == 'monitor')
 {
 	// Aggregated JSON stats for the standalone monitoring dashboard
 	// (monitor_server/server_monitor.php): CPU, disk, network and cache counters
 	// in one authenticated call. CPU jiffies and network byte counters are
 	// cumulative (straight from /proc), so the dashboard computes usage rates
 	// from the delta between its own polls and this endpoint stays stateless.
-	if ($_REQUEST['cv'] != $config['cv'])
+	if (!edge_check_cv($hash, true, false))
 	{
 		sleep(1);
 		http_response_code(403);
-		header("KVS-Errno: 2");
-		echo "Access denied (errno 2)";
-		die;
+		die('missing key');
 	}
 	header('Content-Type: application/json; charset=utf-8');
 	header('Cache-Control: no-store');
@@ -296,14 +315,25 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 		'views_24h'   => remote_monitor_recent_views(86400),
 	));
 	die;
-} elseif ($_REQUEST['action'] == 'time')
+} elseif ($action == 'time')
 {
-	echo time();
-	die;
-} elseif ($_REQUEST['action'] == 'check')
+	if (!edge_check_cv($hash, false, true))
+	{
+		sleep(1);
+		http_response_code(403);
+		die('missing key');
+	}
+	die(strval(time()));
+} elseif ($action == 'check')
 {
-	$content_path = $_REQUEST['content_path'];
-	$paths = explode('||', $_REQUEST['files']);
+	if (!edge_check_cv($hash, false, true))
+	{
+		sleep(1);
+		http_response_code(403);
+		die('missing key');
+	}
+	$content_path = trim($_REQUEST['content_path'] ?? '');
+	$paths = explode('||', $_REQUEST['files'] ?? '');
 	foreach ($paths as $path)
 	{
 		if ($path)
@@ -315,58 +345,51 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 			}
 			if ($path_rec[1] > 0)
 			{
-				if (sprintf("%.0f", @filesize($path_rec[0])) != $path_rec[1])
+				$actual_size = 0;
+				if (($actual_size = sprintf("%.0f", @filesize($path_rec[0]))) != $path_rec[1])
 				{
-					echo "$path_rec[0] (expected size $path_rec[1])";
-					die;
+					die("$path_rec[0] (expected size $path_rec[1], actual size $actual_size)");
 				}
 			} else
 			{
 				if (sprintf("%.0f", @filesize($path_rec[0])) < 1)
 				{
-					echo $path_rec[0];
-					die;
+					die($path_rec[0]);
 				}
 			}
 		}
 	}
-	echo '1';
-	die;
-} elseif ($_REQUEST['file'] <> '')
+	die('1');
+} elseif ($file != '')
 {
-	$time = intval($_REQUEST['time']);
-	$limit = intval($_REQUEST['lr']);
-	$cv = trim($_REQUEST['cv2']);
-	$target_file = rawurldecode($_REQUEST['file']);
-	$is_download = trim($_GET['download']);
-
+	$target_file = rawurldecode($file);
 	if (strpos($target_file, 'B64') === 0)
 	{
+		// old-style parameters
+		$ttl = 7200;
 		$target_file_info = @unserialize(base64_decode(substr($target_file, 3)));
 
 		if (!isset($target_file_info['time'], $target_file_info['cv'], $target_file_info['file']))
 		{
 			http_response_code(403);
-			header("KVS-Errno: 2");
-			echo "Access denied (errno 2)";
+			header('X-Edge-Auth-Status: invalid');
 			die;
 		}
 
 		if ($target_file_info['time'] < time() - $ttl || $target_file_info['time'] > time() + $ttl)
 		{
 			http_response_code(403);
-			header("KVS-Errno: 3");
-			echo "Access denied (errno 3)";
+			header('X-Edge-Auth-Status: expired');
 			die;
 		}
 
-		$allowed_ips = explode(',', trim($_COOKIE["kt_remote_ips"]));
+		$allowed_ips = explode(',', trim($_COOKIE['kt_remote_ips'] ?? ''));
 		if (md5($target_file_info['time'] . $target_file_info['limit'] . $target_file_info['file'] . $_SERVER['REMOTE_ADDR'] . $config['cv']) !== $target_file_info['cv'])
 		{
 			$ip_valid = false;
 			foreach ($allowed_ips as $allowed_ip)
 			{
-				$allowed_ip = explode("||", $allowed_ip);
+				$allowed_ip = explode('||', $allowed_ip);
 				if ($allowed_ip[1] === md5($allowed_ip[0] . $config['cv']))
 				{
 					if (md5($target_file_info['time'] . $target_file_info['limit'] . $target_file_info['file'] . $allowed_ip[0] . $config['cv']) === $target_file_info['cv'])
@@ -391,9 +414,7 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 			if (!$ip_valid)
 			{
 				http_response_code(403);
-				header("KVS-Errno: 4");
-				header("KVS-IP: $_SERVER[REMOTE_ADDR]");
-				echo "Access denied (errno 4)";
+				header('X-Edge-Auth-Status: denied');
 				die;
 			}
 		} else
@@ -401,7 +422,7 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 			$has_ip_cookie = false;
 			foreach ($allowed_ips as $allowed_ip)
 			{
-				$allowed_ip = explode("||", $allowed_ip);
+				$allowed_ip = explode('||', $allowed_ip);
 				if ($allowed_ip[0] == $_SERVER['REMOTE_ADDR'])
 				{
 					$has_ip_cookie = true;
@@ -412,38 +433,46 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 				$allowed_ips[] = $_SERVER['REMOTE_ADDR'] . '||' . md5($_SERVER['REMOTE_ADDR'] . $config['cv']);
 				if (version_compare(PHP_VERSION, '7.3.0') >= 0)
 				{
-					setcookie("kt_remote_ips", implode(',', $allowed_ips), ['expires' => time() + $ttl, 'path' => '/', 'samesite' => 'Lax']);
+					setcookie('kt_remote_ips', implode(',', $allowed_ips), ['expires' => time() + $ttl, 'path' => '/', 'samesite' => 'Lax']);
 				} else
 				{
-					setcookie("kt_remote_ips", implode(',', $allowed_ips), time() + $ttl, "/");
+					setcookie('kt_remote_ips', implode(',', $allowed_ips), time() + $ttl, '/');
 				}
 			}
 		}
 
 		$target_file = $target_file_info['file'];
+		$target_filename = basename($target_file);
 		$limit = $target_file_info['limit'];
-	} else
+	} elseif (strpos($target_file, '/') !== false)
 	{
+		// old-style parameters
+		$ttl = 7200;
+		$target_filename = basename($target_file);
+		$time = intval($_REQUEST['time'] ?? 0);
+		$limit = intval($_REQUEST['lr'] ?? 0);
+		$cv = trim($_REQUEST['cv2'] ?? '');
+		$cv3 = trim($_REQUEST['cv3'] ?? '');
+		$cv4 = trim($_REQUEST['cv4'] ?? '');
+
 		if ($time < time() - $ttl || $time > time() + $ttl)
 		{
 			http_response_code(403);
-			header("KVS-Errno: 3");
-			echo "Access denied (errno 3)";
+			header('X-Edge-Auth-Status: expired');
 			die;
 		}
 
 		if (md5($time . $limit . $config['cv']) !== $cv)
 		{
 			http_response_code(403);
-			header("KVS-Errno: 4");
-			echo "Access denied (errno 4)";
+			header('X-Edge-Auth-Status: denied');
 			die;
 		}
 
-		if ($_SERVER['HTTP_REFERER'] != '' && $_REQUEST['cv3'] != '')
+		if ($_SERVER['HTTP_REFERER'] != '' && $cv3 != '')
 		{
 			$ref_host = parse_url(str_replace('www.', '', $_SERVER['HTTP_REFERER']), PHP_URL_HOST);
-			if ($ref_host != '' && $ref_host != $_SERVER['SERVER_NAME'] && md5($ref_host . $config['cv']) !== trim($_REQUEST['cv3']))
+			if ($ref_host != '' && $ref_host != $_SERVER['SERVER_NAME'] && md5($ref_host . $config['cv']) !== $cv3)
 			{
 				$referer_valid = false;
 				$whitelist_referers = array_map('trim', explode(',', trim($whitelist_referers)));
@@ -459,61 +488,186 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 				if (!$referer_valid)
 				{
 					http_response_code(403);
-					header("KVS-Errno: 5");
-					echo "Access denied (errno 5)";
+					header('X-Edge-Auth-Status: denied');
 					die;
 				}
 			}
 		}
 
-		if (md5($target_file . $config['cv']) !== trim($_REQUEST['cv4']))
+		if (md5($target_file . $config['cv']) !== $cv4)
 		{
 			http_response_code(403);
-			header("KVS-Errno: 6");
-			echo "Access denied (errno 6)";
+			header('X-Edge-Auth-Status: denied');
+			die;
+		}
+	} else
+	{
+		if (($pos = strpos($target_file, '.')) !== false)
+		{
+			$target_file = substr($target_file, 0, $pos);
+		}
+		$target_file_info = decode_token($target_file, $config['cv'], md5($config['cv']));
+		if (md5(substr($target_file_info, 0, -32)) != substr($target_file_info, -32))
+		{
+			http_response_code(404);
+			die;
+		}
+		$target_file_info = explode('|', $target_file_info);
+
+		$target_file = $target_file_info[1];
+		$target_filename = $target_file_info[0];
+		$target_ext = strtolower(pathinfo($target_file, PATHINFO_EXTENSION));
+		$target_filename = "$target_filename.$target_ext";
+		$limit = 0;
+
+		$is_access_token_valid = false;
+		$access_token = $_REQUEST['acctoken'] ?? '';
+		if (!empty($access_token))
+		{
+			$access_token = b64urldecode($access_token);
+			if (md5(substr($access_token, 0, -32) . $config['cv']) == substr($access_token, -32))
+			{
+				$access_token = explode('|', $access_token);
+				if (hash_hmac('sha256', $target_file_info[1], $config['cv']) == $access_token[0])
+				{
+					if (time() - 600 < $access_token[1])
+					{
+						$limit = intval($access_token[2]);
+
+						$locked_to_referer = $access_token[3];
+						$disallow_empty_referers = intval($access_token[4]) == 1;
+
+						$referer = trim($_SERVER['HTTP_REFERER'] ?? '');
+						$referer_host = parse_url(str_replace('www.', '', $referer), PHP_URL_HOST);
+						$own_host = str_replace('www.', '', $_SERVER['HTTP_HOST']);
+
+						$referer_allowed = false;
+						if (empty($referer) || empty($referer_host))
+						{
+							if (!$disallow_empty_referers)
+							{
+								$referer_allowed = true;
+							}
+						} else
+						{
+							if ($referer_host === $locked_to_referer || $referer_host === $own_host || $referer_host === 'mediaservices.cdn-apple.com')
+							{
+								$referer_allowed = true;
+							} elseif (!empty($whitelist_referers))
+							{
+								$whitelist_domains = explode(',', $whitelist_referers);
+								foreach ($whitelist_domains as $whitelist_domain)
+								{
+									$whitelist_domain = trim(str_replace(['http://', 'https://', '//', 'www.'], '', $whitelist_domain));
+									if (!empty($whitelist_domain))
+									{
+										if ($referer_host == $whitelist_domain || substr($referer_host, -strlen(".$whitelist_domain")) == ".$whitelist_domain")
+										{
+											$referer_allowed = true;
+											break;
+										}
+									}
+								}
+							}
+						}
+
+						if ($referer_allowed)
+						{
+							$locked_to_ip = $access_token[5];
+							if (!empty($locked_to_ip))
+							{
+								if ($_SERVER['REMOTE_ADDR'] == $locked_to_ip)
+								{
+									$is_access_token_valid = true;
+								} elseif (!empty($_COOKIE['kt_acctoken'] ?? ''))
+								{
+									$cookie_ips = [];
+									$cookie_decoded = b64urldecode($_COOKIE['kt_acctoken']);
+									foreach (explode(',', $cookie_decoded) as $cookie_ip)
+									{
+										if ($cookie_ip == $locked_to_ip)
+										{
+											$is_access_token_valid = true;
+											break;
+										}
+									}
+								} elseif (!empty($whitelist_ips))
+								{
+									$whitelist_ips = explode(',', $whitelist_ips);
+									foreach ($whitelist_ips as $whitelist_ip)
+									{
+										if (!empty($whitelist_ip))
+										{
+											if ($_SERVER['REMOTE_ADDR'] == $whitelist_ip)
+											{
+												$is_access_token_valid = true;
+												break;
+											}
+										}
+									}
+								}
+							} else
+							{
+								$is_access_token_valid = true;
+							}
+						} else
+						{
+							header('X-Edge-Auth-Status: denied');
+						}
+					} else
+					{
+						header('X-Edge-Auth-Status: expired');
+					}
+				} else
+				{
+					header('X-Edge-Auth-Status: invalid');
+				}
+			}
+		}
+		if (!$is_access_token_valid)
+		{
+			if (is_verified_seo_bot())
+			{
+				$is_access_token_valid = true;
+			}
+		}
+		if (!$is_access_token_valid)
+		{
+			http_response_code(403);
 			die;
 		}
 	}
 
-	if (floatval($_REQUEST['start']) > 0)
+	if (strpos($target_file, '.mp4') !== false)
 	{
-		$start_str = "?start=" . floatval($_REQUEST['start']);
-	}
-
-	if (strpos($target_file, ".flv") !== false)
+		header('Content-Type: video/mp4');
+	} elseif (strpos($target_file, '.webm') !== false)
 	{
-		header("Content-Type: video/x-flv");
-	} elseif (strpos($target_file, ".mp4") !== false)
+		header('Content-Type: video/webm');
+	} elseif (strpos($target_file, '.jpg') !== false)
 	{
-		header("Content-Type: video/mp4");
-	} elseif (strpos($target_file, ".webm") !== false)
+		header('Content-Type: image/jpeg');
+	} elseif (strpos($target_file, '.gif') !== false)
 	{
-		header("Content-Type: video/webm");
-	} elseif (strpos($target_file, ".jpg") !== false)
+		header('Content-Type: image/gif');
+	} elseif (strpos($target_file, '.zip') !== false)
 	{
-		header("Content-Type: image/jpeg");
-	} elseif (strpos($target_file, ".gif") !== false)
-	{
-		header("Content-Type: image/gif");
-	} elseif (strpos($target_file, ".zip") !== false)
-	{
-		header("Content-Type: application/zip");
+		header('Content-Type: application/zip');
 	} else
 	{
-		header("Content-Type: application/octet-stream");
+		header('Content-Type: application/octet-stream');
 	}
 
-	$short_file_name = basename($target_file);
-	if ($_REQUEST['download_filename'] <> '')
+	if (($_REQUEST['download_filename'] ?? '') != '')
 	{
-		$short_file_name = $_REQUEST['download_filename'];
+		$target_filename = $_REQUEST['download_filename'];
 	}
-	if ($is_download == 'true')
+	if (trim($_REQUEST['download'] ?? '') == 'true')
 	{
-		header("Content-Disposition: attachment; filename=\"$short_file_name\"");
+		header("Content-Disposition: attachment; filename=\"$target_filename\"");
 	} else
 	{
-		header("Content-Disposition: inline; filename=\"$short_file_name\"");
+		header("Content-Disposition: inline; filename=\"$target_filename\"");
 	}
 
 	// -------------------------------------------------------------------------
@@ -530,7 +684,7 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 	{
 		$content_relative = remote_content_relative_path($target_file);
 		$local_path = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_FILENAME'])), '/') . $content_relative;
-		$accel_uri = "$target_file$start_str";
+		$accel_uri = $target_file;
 
 		// Logical, un-prefixed origin path (e.g. "29000/29350/29350_720p.mp4"): the
 		// origin signs its get_file.php hash over this, so strip this edge's content
@@ -543,20 +697,24 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 			$origin_video_file = substr($origin_video_file, strlen($content_prefix) + 1);
 		}
 
-		$client_range = trim($_SERVER['HTTP_RANGE']);
-		$is_partial = ($client_range != '' && !preg_match('#^bytes=0-$#', $client_range));
+		$client_range = trim($_SERVER['HTTP_RANGE'] ?? '');
+		// Classify Range for CDN caching (video players almost never send bare bytes=0-):
+		// - from-start (no range, bytes=0-, bytes=0-N) → fill local cache (all qualities)
+		// - tiny probe (bytes=0-0 / 0-1 / small first slice) → cheap origin proxy only
+		// - mid-file seek on cold cache → wait for in-flight fill, else proxy once
+		$range_from_start = remote_cdn_range_from_start($client_range);
+		$range_tiny_probe = remote_cdn_range_is_tiny_probe($client_range);
+		$is_mid_seek = ($client_range != '' && !$range_from_start);
 
-		// Record that this file was watched, on playback-start requests only (not on
-		// every mid-file seek), so the cleanup cron can age out files nobody views.
-		// Applies to both cache hits and misses; never fatal to serving the file.
-		if (!$is_partial)
+		// Count views on playback start (including typical bytes=0-N), not mid seeks.
+		if ($range_from_start || $client_range == '')
 		{
 			remote_record_view($origin_video_file);
 		}
 
 		if (is_file($local_path))
 		{
-			// CACHE HIT
+			// CACHE HIT — nginx serves bytes and honours Range via X-Accel-Redirect
 			if (intval($limit) > 0)
 			{
 				header("X-Accel-Limit-Rate: $limit");
@@ -570,14 +728,26 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 		// own hot-link/access checks disabled.
 		$origin_file_url = remote_origin_pull_url($origin_url, $origin_sg_id, $origin_server_id, $origin_video_file);
 
-		remote_cdn_log(($is_partial ? 'PROXY' : 'STREAM') . " miss local=$local_path range=" . ($client_range != '' ? $client_range : '-') . " origin=$origin_file_url");
+		// If another worker is already filling this object, wait for it instead of
+		// opening a second full origin download (major bandwidth multiplier).
+		if (remote_cdn_wait_for_local_file($local_path, $local_path . '.lock', 2))
+		{
+			remote_cdn_log("HIT after short wait local=$local_path range=" . ($client_range != '' ? $client_range : '-'));
+			if (intval($limit) > 0)
+			{
+				header("X-Accel-Limit-Rate: $limit");
+			}
+			header("X-Accel-Redirect: $accel_uri");
+			die;
+		}
 
 		// In debug mode, verify up-front that this edge can actually persist what
 		// it is about to fetch — the diagnostic log (next to this script) and, for
 		// a full request, the cache file (under the content tree). If not, show the
 		// reason(s) in the response body instead of silently streaming the video
 		// uncached, so the operator can see and fix the permissions.
-		if (!empty($cdn_debug))
+		$will_cache = (!$range_tiny_probe && ($range_from_start || $client_range == ''));
+		if (!empty($cdn_debug) && $will_cache)
 		{
 			$problems = array();
 
@@ -588,25 +758,22 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 			}
 
 			$cache_dir = dirname($local_path);
-			if (!$is_partial)
+			if (!is_dir($cache_dir))
 			{
-				if (!is_dir($cache_dir))
-				{
-					@mkdir($cache_dir, 0777, true);
-				}
-				if (!is_dir($cache_dir))
-				{
-					$problems[] = "cache dir MISSING and could not be created: $cache_dir";
-				} elseif (!is_writable($cache_dir))
-				{
-					$problems[] = "cache dir NOT writable: $cache_dir";
-				}
+				@mkdir($cache_dir, 0777, true);
+			}
+			if (!is_dir($cache_dir))
+			{
+				$problems[] = "cache dir MISSING and could not be created: $cache_dir";
+			} elseif (!is_writable($cache_dir))
+			{
+				$problems[] = "cache dir NOT writable: $cache_dir";
 			}
 
 			if ($problems)
 			{
 				remote_cdn_debug_fail(implode(' | ', $problems), array(
-					'request_type' => $is_partial ? 'partial/seek (range=' . $client_range . ')' : 'full',
+					'request_type' => 'cache-fill (range=' . ($client_range != '' ? $client_range : '-') . ')',
 					'script_dir'   => $log_dir,
 					'cache_dir'    => $cache_dir,
 					'local_path'   => $local_path,
@@ -615,27 +782,227 @@ if ($_REQUEST['action'] == '' && $_REQUEST['file'] == '')
 			}
 		}
 
-		if ($is_partial)
+		if ($range_tiny_probe)
 		{
-			// A seek / partial request on a cold file: proxy just this byte range
-			// from the origin without caching (a partial body must never be stored
-			// as if it were the whole file). The cache fills on a full request.
+			// Player size probes (bytes=0-1 etc.): do not pull the whole object.
+			remote_cdn_log("PROXY probe local=$local_path range=$client_range origin=$origin_file_url");
 			remote_cdn_proxy($origin_file_url, $client_range, intval($limit));
+		} elseif ($will_cache)
+		{
+			// From-start / full GET (incl. bytes=0-N from players): ONE progressive
+			// origin pull that fills the cache for any quality/code. Concurrent
+			// requests wait for this fill instead of opening more origin streams.
+			remote_cdn_log("STREAM miss local=$local_path range=" . ($client_range != '' ? $client_range : '-') . " origin=$origin_file_url");
+			remote_cdn_stream_and_cache($origin_file_url, $local_path, intval($limit), $accel_uri);
 		} else
 		{
-			// A full request: stream the file from the origin to the visitor while
-			// writing it to the local cache.
-			remote_cdn_stream_and_cache($origin_file_url, $local_path, intval($limit), $accel_uri);
+			// Mid-file seek on a cold object: wait longer for an in-flight fill, else proxy once.
+			if (remote_cdn_wait_for_local_file($local_path, $local_path . '.lock', 45))
+			{
+				remote_cdn_log("HIT after fill-wait (seek) local=$local_path range=$client_range");
+				if (intval($limit) > 0)
+				{
+					header("X-Accel-Limit-Rate: $limit");
+				}
+				header("X-Accel-Redirect: $accel_uri");
+			} else
+			{
+				remote_cdn_log("PROXY seek miss local=$local_path range=$client_range origin=$origin_file_url");
+				remote_cdn_proxy($origin_file_url, $client_range, intval($limit));
+			}
 		}
 		die;
 	}
 
-	// Pull-through caching disabled (no origin configured): original behaviour.
+	// Pull-through caching disabled (no origin configured): stock behaviour.
 	if (intval($limit) > 0)
 	{
 		header("X-Accel-Limit-Rate: $limit");
 	}
-	header("X-Accel-Redirect: $target_file{$start_str}");
+	header("X-Accel-Redirect: $target_file");
+}
+
+// Validate the shared-secret hash on control actions. The 6.4 API sends
+// cv=md5(secret); $allow_raw additionally accepts the raw secret (the 'path'
+// action historically, plus this edge's cdncheck/monitor). $allow_empty lets a
+// missing cv through when $allow_unauthenticated_legacy_actions is enabled,
+// for KVS cores older than 6.4 that call these actions without any hash.
+function edge_check_cv($hash, $allow_raw = false, $allow_empty = false)
+{
+	global $config, $allow_unauthenticated_legacy_actions;
+
+	if ($hash === '')
+	{
+		return $allow_empty && !empty($allow_unauthenticated_legacy_actions);
+	}
+	if (hash_equals(md5($config['cv']), $hash))
+	{
+		return true;
+	}
+	return $allow_raw && hash_equals($config['cv'], $hash);
+}
+
+function kbin16(string $key): string
+{
+	$hb = ctype_xdigit($key) && strlen($key) === 32 ? hex2bin($key) : null;
+	return $hb !== null ? $hb : md5($key, true);
+}
+
+function build_keystream(int $length, string $key, string $iv): string {
+	$out = '';
+	$ctr = 0;
+	while (strlen($out) < $length) {
+		$out .= hash_hmac('sha256', $iv . pack('N', $ctr++), $key, true);
+	}
+	return substr($out, 0, $length);
+}
+
+function b64urldecode(string $string)
+{
+	$string = strtr($string, '-_', '+/');
+	return base64_decode($string . str_repeat('=', (4 - strlen($string) % 4) % 4), true);
+}
+
+function decode_token(string $token, string $key_enc, string $key_sign): string
+{
+	if ($token === '')
+	{
+		return '';
+	}
+	$blob = b64urldecode($token);
+	if ($blob === false || strlen($blob) < 16 + 12)
+	{
+		return '';
+	}
+
+	$iv = substr($blob, 0, 16);
+	$tag = substr($blob, -12);
+	$cipher = substr($blob, 16, -12);
+
+	$kenc = kbin16($key_enc);
+	$kmac = kbin16($key_sign);
+
+	$sign_input = $iv . $cipher;
+	if (!hash_equals(substr(hash_hmac('sha256', $sign_input, $kmac, true), 0, 12), $tag))
+	{
+		return '';
+	}
+
+	$keystream = build_keystream(strlen($cipher), $kenc, $iv);
+	return $cipher ^ $keystream;
+}
+
+function is_verified_seo_bot(): bool
+{
+	return is_verified_google_bot() || is_verified_bing_bot() || is_verified_yandex_bot();
+}
+
+function is_verified_google_bot(): bool
+{
+	$user_agent = trim($_SERVER['HTTP_USER_AGENT'] ?? '');
+	$ip = trim($_SERVER['REMOTE_ADDR'] ?? '');
+	if (stripos($user_agent, 'google') !== false)
+	{
+		// check reverse DNS lookup
+		$host = gethostbyaddr($ip);
+		if ($host === false || $host === $ip)
+		{
+			return false;
+		}
+		if (substr($host, -strlen('.googlebot.com')) === '.googlebot.com' || substr($host, -strlen('.google.com')) === '.google.com')
+		{
+			$records = dns_get_record($host, DNS_A + DNS_AAAA);
+			if (!$records)
+			{
+				return false;
+			}
+
+			foreach ($records as $record)
+			{
+				if (!empty($record['ip']) && $record['ip'] === $ip)
+				{
+					return true;
+				}
+				if (!empty($record['ipv6']) && strcasecmp($record['ipv6'], $ip) === 0)
+				{
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+function is_verified_bing_bot(): bool
+{
+	$user_agent = trim($_SERVER['HTTP_USER_AGENT'] ?? '');
+	$ip = trim($_SERVER['REMOTE_ADDR'] ?? '');
+	if (stripos($user_agent, 'bingbot') !== false)
+	{
+		// check reverse DNS lookup
+		$host = gethostbyaddr($ip);
+		if ($host === false || $host === $ip)
+		{
+			return false;
+		}
+		if (substr($host, -strlen('.search.msn.com')) === '.search.msn.com')
+		{
+			$records = dns_get_record($host, DNS_A + DNS_AAAA);
+			if (!$records)
+			{
+				return false;
+			}
+
+			foreach ($records as $record)
+			{
+				if (!empty($record['ip']) && $record['ip'] === $ip)
+				{
+					return true;
+				}
+				if (!empty($record['ipv6']) && strcasecmp($record['ipv6'], $ip) === 0)
+				{
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+function is_verified_yandex_bot(): bool
+{
+	$user_agent = trim($_SERVER['HTTP_USER_AGENT'] ?? '');
+	$ip = trim($_SERVER['REMOTE_ADDR'] ?? '');
+	if (stripos($user_agent, 'yandex') !== false)
+	{
+		// check reverse DNS lookup
+		$host = gethostbyaddr($ip);
+		if ($host === false || $host === $ip)
+		{
+			return false;
+		}
+		if (substr($host, -strlen('.yandex.ru')) === '.yandex.ru' || substr($host, -strlen('.yandex.net')) === '.yandex.net' || substr($host, -strlen('.yandex.com')) === '.yandex.com')
+		{
+			$records = dns_get_record($host, DNS_A + DNS_AAAA);
+			if (!$records)
+			{
+				return false;
+			}
+
+			foreach ($records as $record)
+			{
+				if (!empty($record['ip']) && $record['ip'] === $ip)
+				{
+					return true;
+				}
+				if (!empty($record['ipv6']) && strcasecmp($record['ipv6'], $ip) === 0)
+				{
+					return true;
+				}
+			}
+		}
+	}
+	return false;
 }
 
 // #############################################################################
@@ -702,7 +1069,10 @@ function remote_cdn_log($msg)
 	// $_SERVER['REMOTE_ADDR'] was already resolved to the end-user's IP at the top
 	// of this script; also record the raw forwarding chain when present.
 	$ip = 'ip=' . $_SERVER['REMOTE_ADDR'];
-	if (isset($_SERVER['HTTP_X_FORWARDED_FOR']) && trim($_SERVER['HTTP_X_FORWARDED_FOR']) != '')
+	if (isset($_SERVER['HTTP_CF_CONNECTING_IP']) && trim($_SERVER['HTTP_CF_CONNECTING_IP']) != '')
+	{
+		$ip .= ' cfip=' . trim($_SERVER['HTTP_CF_CONNECTING_IP']);
+	} elseif (isset($_SERVER['HTTP_X_FORWARDED_FOR']) && trim($_SERVER['HTTP_X_FORWARDED_FOR']) != '')
 	{
 		$ip .= ' xff=' . trim($_SERVER['HTTP_X_FORWARDED_FOR']);
 	} elseif (isset($_SERVER['HTTP_X_REAL_IP']) && trim($_SERVER['HTTP_X_REAL_IP']) != '')
@@ -759,6 +1129,281 @@ function remote_content_relative_path($target_file)
 	$path = preg_replace('#/\.\.(?=/|$)#', '', $path);
 	return $path;
 }
+
+
+// --- CDN Range / fill helpers (bandwidth fix) --------------------------------
+
+// True when the client wants the object from byte 0 (full GET, bytes=0-, bytes=0-N).
+// Modern players almost always send bytes=0-<end>, not bare bytes=0-.
+function remote_cdn_range_from_start($client_range)
+{
+	$client_range = trim($client_range);
+	if ($client_range === '')
+	{
+		return true;
+	}
+	return (bool) preg_match('#^bytes=0-(\d*)$#i', $client_range);
+}
+
+// Tiny first-byte probes used by players/CDNs to learn size — not worth a full pull.
+function remote_cdn_range_is_tiny_probe($client_range)
+{
+	$client_range = trim($client_range);
+	if (!preg_match('#^bytes=0-(\d+)$#i', $client_range, $m))
+	{
+		return false;
+	}
+	return intval($m[1]) <= 1023; // 0-0 .. 0-1023
+}
+
+// Wait until $local_path exists (cache fill finished) or timeout. Uses shared flock
+// on the fill lock when present so waiters wake when the filler releases EX lock.
+function remote_cdn_wait_for_local_file($local_path, $lock_path, $timeout_sec)
+{
+	$deadline = microtime(true) + max(1, intval($timeout_sec));
+	// Fast path
+	if (is_file($local_path) && filesize($local_path) > 0)
+	{
+		return true;
+	}
+
+	// Prefer blocking shared lock (released when filler finishes EX section)
+	$wait = @fopen($lock_path, 'c');
+	if ($wait)
+	{
+		// Non-blocking first: if no exclusive holder, flock SH succeeds immediately
+		$locked = @flock($wait, LOCK_SH | LOCK_NB);
+		if (!$locked)
+		{
+			// Someone holds EX — block with a soft timeout via loop + LOCK_SH|LOCK_NB
+			while (microtime(true) < $deadline)
+			{
+				if (is_file($local_path) && @filesize($local_path) > 0)
+				{
+					@fclose($wait);
+					return true;
+				}
+				if (@flock($wait, LOCK_SH | LOCK_NB))
+				{
+					@flock($wait, LOCK_UN);
+					break;
+				}
+				usleep(200000); // 200ms
+			}
+		} else
+		{
+			@flock($wait, LOCK_UN);
+		}
+		@fclose($wait);
+	}
+
+	// Poll remaining time for the renamed cache object
+	while (microtime(true) < $deadline)
+	{
+		if (is_file($local_path) && @filesize($local_path) > 0)
+		{
+			return true;
+		}
+		usleep(200000);
+	}
+	return (is_file($local_path) && @filesize($local_path) > 0);
+}
+
+// Cap simultaneous origin→disk cache fills (per-file lock still applies).
+// Prevents hundreds of multi-GB pulls at once when many unique cold titles hit.
+function remote_cdn_acquire_fill_slot($max_slots = 48, $timeout_sec = 120)
+{
+	$dir = rtrim(str_replace('\\', '/', dirname(__FILE__)), '/') . '/.cdn_fill_slots';
+	if (!is_dir($dir))
+	{
+		@mkdir($dir, 0777, true);
+	}
+	$deadline = microtime(true) + max(1, intval($timeout_sec));
+	$handles = array();
+	while (microtime(true) < $deadline)
+	{
+		for ($i = 0; $i < intval($max_slots); $i++)
+		{
+			$fp = @fopen($dir . '/slot_' . $i . '.lock', 'c');
+			if (!$fp)
+			{
+				continue;
+			}
+			if (@flock($fp, LOCK_EX | LOCK_NB))
+			{
+				// hold $fp open for caller
+				return $fp;
+			}
+			@fclose($fp);
+		}
+		usleep(100000);
+	}
+	return null;
+}
+
+function remote_cdn_release_fill_slot($fp)
+{
+	if ($fp)
+	{
+		@flock($fp, LOCK_UN);
+		@fclose($fp);
+	}
+}
+
+// Download the full object from origin into the local cache, then X-Accel-Redirect
+// so nginx applies the client's Range correctly. Only one filler per file; waiters
+// block on the fill lock instead of re-pulling from origin.
+function remote_cdn_fetch_to_cache_then_accel($origin_url, $local_path, $limit, $accel_uri, $client_range = '')
+{
+	$tmp_path = $local_path . '.part';
+	$lock_path = $local_path . '.lock';
+
+	$dir = dirname($local_path);
+	if (!is_dir($dir))
+	{
+		@mkdir($dir, 0777, true);
+	}
+	if (!is_dir($dir) || !is_writable($dir))
+	{
+		remote_cdn_log("FILL dir not writable: $dir");
+		header('KVS-CDN: uncached-dir-not-writable');
+		remote_cdn_proxy($origin_url, $client_range, $limit);
+		return;
+	}
+
+	if (is_file($local_path) && filesize($local_path) > 0)
+	{
+		if (intval($limit) > 0)
+		{
+			header("X-Accel-Limit-Rate: $limit");
+		}
+		header("X-Accel-Redirect: $accel_uri");
+		return;
+	}
+
+	$lock = @fopen($lock_path, 'c');
+	$is_filler = ($lock && flock($lock, LOCK_EX | LOCK_NB));
+
+	if (!$is_filler)
+	{
+		if ($lock)
+		{
+			@fclose($lock);
+		}
+		remote_cdn_log("FILL wait concurrent: $local_path");
+		if (remote_cdn_wait_for_local_file($local_path, $lock_path, 600))
+		{
+			if (intval($limit) > 0)
+			{
+				header("X-Accel-Limit-Rate: $limit");
+			}
+			header("X-Accel-Redirect: $accel_uri");
+			return;
+		}
+		// last resort
+		remote_cdn_proxy($origin_url, $client_range, $limit);
+		return;
+	}
+
+	// Double-check after winning the lock
+	if (is_file($local_path) && filesize($local_path) > 0)
+	{
+		@flock($lock, LOCK_UN);
+		@fclose($lock);
+		if (intval($limit) > 0)
+		{
+			header("X-Accel-Limit-Rate: $limit");
+		}
+		header("X-Accel-Redirect: $accel_uri");
+		return;
+	}
+
+	$slot = remote_cdn_acquire_fill_slot(48, 180);
+	if (!$slot)
+	{
+		@flock($lock, LOCK_UN);
+		@fclose($lock);
+		remote_cdn_log("FILL slot busy; proxy once: $local_path");
+		header('KVS-CDN: fill-slot-busy');
+		remote_cdn_proxy($origin_url, $client_range, $limit);
+		return;
+	}
+
+	remote_cdn_enforce_free_space($local_path);
+
+	@set_time_limit(0);
+	ignore_user_abort(true);
+
+	$out = @fopen($tmp_path, 'wb');
+	if (!$out)
+	{
+		remote_cdn_release_fill_slot($slot);
+		@flock($lock, LOCK_UN);
+		@fclose($lock);
+		remote_cdn_log("FILL tmp open failed: $tmp_path");
+		remote_cdn_proxy($origin_url, $client_range, $limit);
+		return;
+	}
+
+	$state = array('out' => $out, 'status' => 0, 'bytes' => 0);
+	$header_cb = function ($header) use (&$state)
+	{
+		if (preg_match('#^HTTP/\S+\s+(\d{3})#', $header, $m))
+		{
+			$state['status'] = intval($m[1]);
+		}
+	};
+	$body_cb = function ($data) use (&$state)
+	{
+		if ($state['status'] >= 200 && $state['status'] < 300)
+		{
+			@fwrite($state['out'], $data);
+			$state['bytes'] += strlen($data);
+		}
+	};
+
+	// Full-object pull (no Range) so the cache file is complete and seekable.
+	$ok = remote_http_pull($origin_url, '', $header_cb, $body_cb);
+	fclose($out);
+
+	$tmp_size = @filesize($tmp_path);
+	$ready = false;
+	if ($ok && $state['status'] >= 200 && $state['status'] < 300 && $tmp_size > 0)
+	{
+		if (@rename($tmp_path, $local_path))
+		{
+			remote_cdn_log("CACHED ok status=$state[status] bytes=$tmp_size -> $local_path");
+			$ready = true;
+		} else
+		{
+			@unlink($tmp_path);
+			remote_cdn_log("rename FAILED $tmp_path -> $local_path");
+		}
+	} else
+	{
+		@unlink($tmp_path);
+		remote_cdn_log("NOT cached ok=" . ($ok ? '1' : '0') . " status=$state[status] bytes=" . intval($tmp_size));
+	}
+
+	remote_cdn_release_fill_slot($slot);
+	@flock($lock, LOCK_UN);
+	@fclose($lock);
+
+	if ($ready && is_file($local_path))
+	{
+		if (intval($limit) > 0)
+		{
+			header("X-Accel-Limit-Rate: $limit");
+		}
+		header('KVS-CDN: fill-then-accel');
+		header("X-Accel-Redirect: $accel_uri");
+		return;
+	}
+
+	// Fill failed: proxy the original client range so playback still works.
+	remote_cdn_proxy($origin_url, $client_range, $limit);
+}
+
 
 // Build a signed get_file.php URL on the origin server that returns the raw file.
 // hash and dsc are signed with the shared secret $config['cv'], and matched by
@@ -925,9 +1570,35 @@ function remote_cdn_stream_and_cache($origin_url, $local_path, $limit, $accel_ur
 		{
 			@fclose($lock);
 		}
-		// Another worker is already filling the cache: proxy without caching.
-		remote_cdn_log("another worker is filling; serving uncached: $local_path");
-		header('KVS-CDN: uncached-concurrent-fill');
+		// Another worker owns the fill: wait for the lock/file, then serve from cache.
+		// Do NOT open a second full origin download (this was burning multi-Gbps RX).
+		remote_cdn_log("another worker is filling; waiting for cache: $local_path");
+		header('KVS-CDN: wait-concurrent-fill');
+		if (remote_cdn_wait_for_local_file($local_path, $lock_path, 600))
+		{
+			remote_cdn_log("waited for fill, serving from cache: $local_path");
+			if (intval($limit) > 0)
+			{
+				header("X-Accel-Limit-Rate: $limit");
+			}
+			header("X-Accel-Redirect: $accel_uri");
+			return;
+		}
+		// Filler failed or timed out: one progressive stream+cache attempt as fallback
+		remote_cdn_log("fill wait timeout/fail; fallback stream_and_cache: $local_path");
+		// Re-enter as potential filler (single retry via stream path would recurse — proxy once only)
+		remote_cdn_proxy($origin_url, '', $limit);
+		return;
+	}
+
+	// Cap global concurrent full-object origin pulls.
+	$fill_slot = remote_cdn_acquire_fill_slot(48, 180);
+	if (!$fill_slot)
+	{
+		@flock($lock, LOCK_UN);
+		@fclose($lock);
+		remote_cdn_log("STREAM slot busy; proxy once: $local_path");
+		header('KVS-CDN: fill-slot-busy');
 		remote_cdn_proxy($origin_url, '', $limit);
 		return;
 	}
@@ -939,6 +1610,7 @@ function remote_cdn_stream_and_cache($origin_url, $local_path, $limit, $accel_ur
 	$out = @fopen($tmp_path, 'wb');
 	if (!$out)
 	{
+		remote_cdn_release_fill_slot($fill_slot);
 		@flock($lock, LOCK_UN);
 		@fclose($lock);
 		remote_cdn_debug_fail("could not open temp file for writing: $tmp_path", array('local_path' => $local_path));
@@ -1012,6 +1684,7 @@ function remote_cdn_stream_and_cache($origin_url, $local_path, $limit, $accel_ur
 		}
 	}
 
+	remote_cdn_release_fill_slot($fill_slot);
 	@flock($lock, LOCK_UN);
 	@fclose($lock);
 }
@@ -1349,3 +2022,4 @@ function remote_monitor_recent_views($seconds)
 		return null;
 	}
 }
+
