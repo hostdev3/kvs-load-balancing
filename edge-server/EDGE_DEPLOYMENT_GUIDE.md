@@ -3,7 +3,7 @@
 This guide walks through deploying one caching edge server per KVS storage group,
 on a platform that already has the default KVS system with 40 storage servers
 (one "master" storage server per group), and updating the main server to support
-them (pull-through caching, pre-warming, and load-based balancing).
+them (pull-through caching and load-based balancing).
 
 ---
 
@@ -26,7 +26,7 @@ them (pull-through caching, pre-warming, and load-based balancing).
         └───────────────────────┘   (admin_rq_server_id) └──────────────────────────┘
 ```
 
-How an edge gets content (three ways):
+How an edge gets content (two ways):
 
 1. **Push (KVS-native mirroring).** KVS uploads every *new* video's files to every
    server in the group — the edge included. This is why the edge needs a working
@@ -34,10 +34,11 @@ How an edge gets content (three ways):
 2. **Pull-through (backfill).** Files that existed *before* the edge joined are not
    on its disk. On the first request the edge pulls the file from the origin
    through `get_file.php` (signed with the shared secret), streams it to the
-   visitor, and caches it. No bulk migration of terabytes is ever needed.
-3. **Pre-warm (cron).** `edge_prewarm.php` downloads the group's top-N most-viewed
-   videos ahead of demand, and evicts stale / least-recently-viewed files to keep
-   the disk bounded.
+   visitor, and caches it. No bulk migration of terabytes is ever needed. The
+   cache therefore fills itself with whatever is actually being watched.
+
+A cleanup cron (`edge_prewarm.php`) evicts stale / least-recently-viewed files
+to keep the disk bounded.
 
 Load-based balancing (new): `get_file.php` on the main server checks each
 candidate's load through the edge control script's `action=load` API (cached
@@ -51,8 +52,7 @@ an overloaded edge simply fails over to its master.
 | File (this repo)                              | Deploys to      | Role |
 |-----------------------------------------------|-----------------|------|
 | `edge_storage_server/edge_remote_control .php`| each edge, renamed **`remote_control.php`** | control script + pull-through cache + `action=load` API |
-| `edge_storage_server/edge_prewarm.php`        | each edge       | cron: pre-warm top videos, evict stale/LRU files |
-| `get_top_videos.php`                          | main web root   | top-videos list endpoint used by the prewarm cron |
+| `edge_storage_server/edge_prewarm.php`        | each edge       | cron: evict stale/LRU cached files |
 | `get_file.php` (modified)                     | main web root   | adds load-threshold failover to server selection |
 | `admin/include/functions_server_load.php` (new)| main server    | cached load probing for get_file.php |
 | `monitor_server/server_monitor.php`           | any PHP host (main server or an ops box) | standalone monitoring dashboard: add servers by IP/port, see edge status, storage, bandwidth, CPU and cached-video counts (uses the edge `action=monitor` API; see §10) |
@@ -99,7 +99,7 @@ Suggested spreadsheet columns:
 
 | # | Value | Where to find it | Example |
 |---|-------|------------------|---------|
-| 1 | Group ID (`edge_group_id`, admin "server group") | Admin → Settings → Storage servers → the group of that group's master server | `7` |
+| 1 | Group ID (admin "server group")                  | Admin → Settings → Storage servers → the group of that group's master server | `7` |
 | 2 | Master server ID (`origin_server_id`)            | The `server_id` of the group's master storage server (visible in the server edit URL, `servers.php?...&id=N`) | `8` |
 | 3 | Edge hostname                                     | your DNS plan, one per group | `edge-g07.example.com` |
 | 4 | Content prefix (`origin_content_prefix`)          | path segment of the edge's "URLs" setting; keep `videos` everywhere | `videos` |
@@ -182,8 +182,8 @@ server {
 
     root /var/www/edge;
 
-    # control script (and prewarm's optional HTTP trigger)
-    location ~ ^/(remote_control|edge_prewarm)\.php$ {
+    # control script (edge_prewarm.php is cron/CLI-only and deliberately NOT routed)
+    location ~ ^/remote_control\.php$ {
         include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
         fastcgi_pass unix:/run/php/php-fpm.sock;
@@ -226,21 +226,14 @@ $cache_min_free_bytes  = 20 * 1024*1024*1024;  // real-time low-disk guard, see 
 $config['cv'] = "<main server's \$config['cv']>";
 ```
 
-### 4.6 Configure `edge_prewarm.php`
+### 4.6 Configure `edge_prewarm.php` (cache cleanup cron)
 
-Upload it next to `remote_control.php` and edit the header:
+Upload it next to `remote_control.php` and edit the header (it runs from cron
+only — no shared secret needed, the web server never routes it):
 
 ```php
-$config['cv']          = "<same cv>";
-$origin_url            = "https://baddies.xxx";
-$origin_server_id      = "8";      // same as remote_control.php
-$origin_sg_id          = 7;
 $origin_content_prefix = "videos";
 
-$top_limit     = 200;              // videos kept warm
-$edge_group_id = 7;                // ← MUST equal this edge's KVS group
-
-$enable_cleanup = true;
 $stale_days     = 14;              // evict files not viewed for 2 weeks
 $view_db_path   = __DIR__ . '/edge_cache.sqlite';   // must match remote_control.php
 
@@ -250,7 +243,7 @@ $max_cache_bytes = 1800 * 1024*1024*1024;  // e.g. 1.8 TB cap on a 2 TB disk
 $min_free_bytes  =  100 * 1024*1024*1024;  // keep 100 GB free
 ```
 
-**Sizing rule:** `$min_free_bytes` (prewarm) and `$cache_min_free_bytes`
+**Sizing rule:** `$min_free_bytes` (cleanup cron) and `$cache_min_free_bytes`
 (remote_control.php) must both be comfortably **larger** than
 `SERVER_GROUP_MIN_FREE_SPACE_MB × 1024²`, because conversion refuses to process
 new videos for the whole group when any member's free space falls below that
@@ -280,8 +273,8 @@ curl "https://edge-g07.example.com/remote_control.php?action=cdncheck&cv=<cv>"
 curl "https://edge-g07.example.com/remote_control.php?action=monitor&cv=<cv>"
 # → JSON stats blob (cpu/net/disk/cache) used by the monitoring dashboard (§10)
 
-php /var/www/edge/edge_prewarm.php          # first warm run (may take a while)
-tail /var/www/edge/edge_prewarm.log         # expect "cached=..." lines, no FAILs
+php /var/www/edge/edge_prewarm.php          # first cleanup run (fast on an empty cache)
+tail /var/www/edge/edge_prewarm.log         # expect a "done: evicted=..." summary line
 ```
 
 Also verify direct content access is blocked (should be 404, because of
@@ -291,10 +284,9 @@ Also verify direct content access is blocked (should be 404, because of
 
 ## 5. Part B — Update the main server (once)
 
-1. Deploy the three changed/new files from this repo to the main server:
+1. Deploy the two changed/new files from this repo to the main server:
    * `get_file.php` (adds the load-threshold failover in server selection)
    * `admin/include/functions_server_load.php` (new helper)
-   * `get_top_videos.php` (prewarm list endpoint; skip if already deployed)
 2. Optional tuning — add to `admin/include/setup.php` only if the defaults
    don't suit you:
 
@@ -322,9 +314,9 @@ Behavior notes:
 
 ## 6. Part C — Register the edge in the KVS admin (per group)
 
-**Order matters: warm first, register second.** Run `edge_prewarm.php` once
-(§4.7) *before* activating the server so the hottest content is already local
-and the first hours don't hammer the origin.
+The edge starts with an empty cache and fills it on demand (pull-through), so
+expect elevated origin traffic during the first hours after registration while
+the hottest content gets cached.
 
 Admin → Settings → Storage servers → **Add server**:
 
@@ -384,7 +376,7 @@ and requests a real video through the edge (which exercises pull-through).
 2. **Template the rest.** Between edges only these values change:
    * DNS name / TLS cert
    * `$origin_server_id` (master id of the group)
-   * `$origin_sg_id` / `$edge_group_id` (group id)
+   * `$origin_sg_id` (group id)
    * admin registration fields (group, URLs, control script, FTP)
    Everything else — nginx vhost, FTP daemon, cron line, `cv`, `origin_url` —
    is identical, so bake an image or a small provisioning script.
@@ -406,7 +398,7 @@ and requests a real video through the edge (which exercises pull-through).
   check (connection=1, control script=2/3, clock=4, validation=5, CDN api=6,
   https=7).
 * Edge logs: `remote_control_cdn.log` (misses, caches, evictions, failures),
-  `edge_prewarm.log` (warm/cleanup summary per run).
+  `edge_prewarm.log` (cleanup summary per run).
 * Main: `admin/data/system/server_load_<id>.dat` (last probe: `ts|load|cores|ok`),
   and `admin/logs/get_file.txt` when `$config['enable_debug_get_file']` is on.
 * The admin panel's server "load" column comes from the periodic server check —
@@ -419,9 +411,9 @@ and requests a real video through the edge (which exercises pull-through).
 * `lb_load_threshold`: streaming boxes run high loadavg from I/O wait — if
   edges get skipped too eagerly, raise it (per core); if they melt before
   skipping, lower it.
-* `$top_limit` / `$stale_days` / cache caps: balance hit-rate against disk.
-  If `edge_prewarm.log` warns the top list alone exceeds the cap, lower
-  `$top_limit` or add disk.
+* `$stale_days` / cache caps: balance hit-rate against disk. If
+  `edge_prewarm.log` warns it is still over the storage limit after evicting
+  everything it can, add disk or lower the caps.
 
 ### 9.3 Emergency: taking a broken edge out of service
 
@@ -441,7 +433,7 @@ is blocked by) every group member regardless of status. If an edge dies:
 |---------|--------|--------------------|
 | Edge overloaded (load API above threshold) | skipped for up to 60 s at a time | traffic shifts to master; edge rejoins when load drops |
 | Edge origin-pull fails mid-stream | viewer gets 502/partial | file not cached (temp file discarded); next request retries |
-| Edge disk low | real-time LRU eviction (`$cache_min_free_bytes`), then prewarm-cron eviction | keep watermarks above `SERVER_GROUP_MIN_FREE_SPACE_MB` |
+| Edge disk low | real-time LRU eviction (`$cache_min_free_bytes`), then cleanup-cron eviction | keep watermarks above `SERVER_GROUP_MIN_FREE_SPACE_MB` |
 | Edge unreachable | server check sets error 1 → get_file skips it → **conversion for the group stalls** | fix fast or detach (§9.3) |
 | Load API missing/timeout (e.g. master servers) | treated as not overloaded | cached 60 s, no repeated timeout cost |
 | Clock drift > 5 min | error 4, signed links may fail | run chrony/ntp |

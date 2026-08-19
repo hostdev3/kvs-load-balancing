@@ -39,8 +39,8 @@ $whitelist_referers = '';
 //                    ("29000/29350/f.mp4") that get_file.php signs its hash over.
 //                    Leave empty if this script lives inside the content folder.
 $origin_url = "https://pimpbunny.com";
-$origin_server_id = "49";
-$origin_sg_id = 47;
+$origin_server_id = "46";
+$origin_sg_id = 45;
 $origin_content_prefix = "videos";
 
 // set true to append pull-through cache diagnostics to remote_control_cdn.log
